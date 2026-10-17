@@ -1,0 +1,293 @@
+name: scheduled
+
+# Weekly rebuild of the docker image against the latest yt-dlp, gated on
+# integration tests against a real yt-dlp + ffmpeg toolchain. Promotes
+# `:latest` only if the Internet Archive (hard-gate) tests pass. YouTube
+# tests run warn-only because CI IPs are routinely rate-limited / bot-flagged
+# by YouTube; a YouTube-only failure typically indicates network/IP issues
+# rather than a real yt-dlp regression.
+
+on:
+  schedule:
+    # Monday 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run the full pipeline (build + tests) without promoting :latest"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: gfccx/yt-dlp-ui
+
+jobs:
+  build-amd64:
+    name: Build candidate AMD64
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.docker_build.outputs.digest }}
+      ytdlp_version: ${{ steps.version.outputs.ytdlp_version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # No cache-from/cache-to: the Dockerfile's `pip3 install yt-dlp` layer
+      # text never changes, so any cache hit would reuse the previous yt-dlp
+      # version and defeat the purpose of this workflow. A fresh build is
+      # the whole point.
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ github.sha }}
+      - name: Record yt-dlp version
+        id: version
+        run: |
+          # The image's ENTRYPOINT is /yt-dlp-ui (the server), so we must
+          # override it to run `yt-dlp --version` instead of feeding those
+          # tokens as args to the server (which would just start it and hang).
+          VERSION=$(docker run --rm --entrypoint yt-dlp \
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ steps.docker_build.outputs.digest }} \
+            --version)
+          echo "ytdlp_version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Candidate AMD64"
+            echo "- yt-dlp version: \`$VERSION\`"
+            echo "- digest: \`${{ steps.docker_build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-arm64:
+    name: Build candidate ARM64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    outputs:
+      digest: ${{ steps.docker_build.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/arm64
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ github.sha }}
+
+  test-hard-gate:
+    name: Hard gate (Internet Archive)
+    runs-on: ubuntu-latest
+    needs: build-amd64
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ensure ffprobe is available
+        run: which ffprobe || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Start candidate container
+        run: |
+          docker run -d --name yt-dlp-ui -p 8080:8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ needs.build-amd64.outputs.digest }}
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/api/files > /dev/null 2>&1; then
+              echo "Container ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Container failed to become ready within 60s"
+          docker logs yt-dlp-ui
+          exit 1
+      - name: Run Internet Archive integration tests
+        env:
+          YT_DLP_UI_URL: http://127.0.0.1:8080
+        run: |
+          go test -tags integration -v -count=1 -timeout 10m -run InternetArchive ./internal/integration/...
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs yt-dlp-ui
+
+  test-warn-youtube:
+    name: YouTube (warn-only)
+    runs-on: ubuntu-latest
+    needs: build-amd64
+    # Job-level continue-on-error: workflow conclusion stays green even if
+    # this job fails. needs.test-warn-youtube.result still reports 'failure'
+    # to the notify job.
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ensure ffprobe is available
+        run: which ffprobe || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+      - name: Start candidate container
+        run: |
+          docker run -d --name yt-dlp-ui -p 8080:8080 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ needs.build-amd64.outputs.digest }}
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/api/files > /dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs yt-dlp-ui
+          exit 1
+      - name: Run YouTube integration tests
+        env:
+          YT_DLP_UI_URL: http://127.0.0.1:8080
+        run: |
+          go test -tags integration -v -count=1 -timeout 10m -run YouTube ./internal/integration/...
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs yt-dlp-ui
+
+  promote:
+    name: Promote candidate to :latest
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64, test-hard-gate]
+    # YouTube job is intentionally not in needs[]: a YouTube failure must not
+    # block promotion. inputs.dry_run is null on scheduled runs (so `!= true`
+    # is true and promotion proceeds); only a manual dispatch with dry_run
+    # checked skips promotion.
+    if: needs.test-hard-gate.result == 'success' && inputs.dry_run != true
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag :latest and dated manifest
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          AMD64="${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ needs.build-amd64.outputs.digest }}"
+          ARM64="${{ env.REGISTRY }}/${{ env.IMAGE }}@${{ needs.build-arm64.outputs.digest }}"
+          for TAG in latest "$DATE"; do
+            docker buildx imagetools create -t ${{ env.REGISTRY }}/${{ env.IMAGE }}:$TAG \
+              "$AMD64" "$ARM64"
+          done
+          {
+            echo "## Promoted"
+            echo "- \`:latest\`"
+            echo "- \`:$DATE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Open or update failure issue
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64, test-hard-gate, test-warn-youtube, promote]
+    if: |
+      always() && (
+        needs.build-amd64.result == 'failure' ||
+        needs.build-arm64.result == 'failure' ||
+        needs.test-hard-gate.result == 'failure' ||
+        needs.test-warn-youtube.result == 'failure' ||
+        needs.promote.result == 'failure'
+      )
+    steps:
+      - name: Compose failure body
+        env:
+          HARD_GATE: ${{ needs.test-hard-gate.result }}
+          YT: ${{ needs.test-warn-youtube.result }}
+          BUILD_AMD: ${{ needs.build-amd64.result }}
+          BUILD_ARM: ${{ needs.build-arm64.result }}
+          PROMOTE: ${{ needs.promote.result }}
+          YTDLP_VERSION: ${{ needs.build-amd64.outputs.ytdlp_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cat > body.md <<EOF
+          The weekly scheduled rebuild reported failures.
+
+          See [run logs]($RUN_URL).
+
+          Results:
+          - Build AMD64: $BUILD_AMD
+          - Build ARM64: $BUILD_ARM
+          - Internet Archive hard gate: $HARD_GATE
+          - YouTube warn-only: $YT
+          - Promotion: $PROMOTE
+
+          yt-dlp version in candidate image: $YTDLP_VERSION
+
+          Triage:
+          - Hard-gate fail = likely a real yt-dlp regression or archive.org issue. Investigate before next push.
+          - YouTube-only fail (hard-gate green) = typically CI IP rate-limit, not a regression. Verify manually before assuming yt-dlp broke.
+          - Build fail = check the run log for docker / dependency issues.
+          - Promotion fail = tests passed but the manifest re-tag failed; :latest was not updated and still points at the previous good build.
+          EOF
+      - name: Ensure failure label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create scheduled-rebuild-failure \
+            --color FBCA04 \
+            --description "Scheduled rebuild detected a regression or stage failure" \
+            --repo ${{ github.repository }} 2>/dev/null || true
+      - name: Open or update issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue list --repo ${{ github.repository }} \
+            --label scheduled-rebuild-failure --state open \
+            --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "null" ]; then
+            gh issue comment "$EXISTING" --repo ${{ github.repository }} --body-file body.md
+            echo "Commented on existing issue #$EXISTING" >> "$GITHUB_STEP_SUMMARY"
+          else
+            URL=$(gh issue create --repo ${{ github.repository }} \
+              --title "Scheduled rebuild failed ($(date -u +%Y-%m-%d))" \
+              --label scheduled-rebuild-failure \
+              --body-file body.md)
+            echo "Opened new issue: $URL" >> "$GITHUB_STEP_SUMMARY"
+          fi

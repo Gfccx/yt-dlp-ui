@@ -1,0 +1,145 @@
+import { motion } from "framer-motion";
+import { useState } from "react";
+import type { Job } from "../types";
+import { ProgressBar } from "./ProgressBar";
+import { cancelDownload, retryDownload } from "../lib/api";
+import { languageName } from "../lib/audio";
+
+interface Props {
+  job: Job;
+}
+
+function formatSpeed(bytesPerSec: number): string {
+  if (!bytesPerSec || bytesPerSec <= 0) return "";
+  if (bytesPerSec >= 1024 * 1024) {
+    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+  }
+  return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
+}
+
+function formatETA(seconds: number): string {
+  if (!seconds || seconds <= 0) return "";
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return `${m}m ${s}s`;
+}
+
+const statusConfig: Record<
+  string,
+  { label: string; color: string }
+> = {
+  queued: { label: "Queued", color: "bg-zinc-600" },
+  downloading: { label: "Downloading", color: "bg-blue-500" },
+  processing: { label: "Processing", color: "bg-yellow-500" },
+  complete: { label: "Complete", color: "bg-emerald-500" },
+  error: { label: "Error", color: "bg-red-500" },
+  cancelled: { label: "Cancelled", color: "bg-zinc-600" },
+};
+
+export function DownloadItem({ job }: Props) {
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState("");
+  const status = statusConfig[job.status] || statusConfig.queued;
+  const isActive = job.status === "downloading" || job.status === "processing" || job.status === "queued";
+
+  const handleCancel = async () => {
+    try {
+      await cancelDownload(job.id);
+    } catch {
+      // Ignore cancel errors
+    }
+  };
+  const handleRetry = async () => {
+    setRetrying(true);
+    setRetryError("");
+    try { await retryDownload(job.id); }
+    catch (error) { setRetryError(error instanceof Error ? error.message : "Retry failed"); }
+    finally { setRetrying(false); }
+  };
+
+  return (
+    <motion.div
+      role="article"
+      aria-label={job.title || job.url}
+      layout
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -10 }}
+      className="rounded-lg border border-zinc-800 bg-zinc-900 p-4"
+    >
+      {job.playlist_title && (
+        <p className="mb-1 truncate text-[10px] font-medium uppercase tracking-wider text-zinc-500">
+          Playlist · {job.playlist_title}
+        </p>
+      )}
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="min-w-0 flex-1 truncate text-sm font-medium">
+          {job.title || job.url}
+        </span>
+        <div className="flex items-center gap-2">
+          <span
+            className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium text-white ${status.color}`}
+          >
+            {status.label}
+          </span>
+          {isActive && (
+            <button
+              onClick={handleCancel}
+              className="text-xs text-zinc-500 transition-colors hover:text-red-400"
+              title="Cancel download"
+            >
+              ✕
+            </button>
+          )}
+          {(job.status === "error" || job.status === "cancelled") && <button onClick={handleRetry} disabled={retrying} className="text-xs text-zinc-400 hover:text-white disabled:opacity-50">{retrying ? "Retrying…" : "Retry"}</button>}
+        </div>
+      </div>
+
+      <p className="mb-2 break-all text-xs text-zinc-500">{job.proxy_mode === "global" ? "Global snapshot" : job.proxy_mode === "custom" ? "Custom proxy" : "Task route"} · {job.proxy_label}</p>
+      {(job.audio_language || job.audio?.language || job.audio_format_id || job.audio?.format_id) && <p className="mb-2 break-all text-xs text-zinc-400">音轨 · {languageName(job.audio_language || job.audio?.language || "")} · {job.audio_language || job.audio?.language} · {job.audio_format_id || job.audio?.format_id || "运行时选择该语言最高音质"}</p>}
+      {retryError && <p role="alert" className="mb-2 text-xs text-red-400">{retryError}</p>}
+
+      {job.status === "downloading" && (
+        <>
+          <ProgressBar percent={job.progress.percent} />
+          <div className="mt-1.5 flex justify-between text-xs text-zinc-500">
+            <span>{job.progress.percent.toFixed(1)}%</span>
+            <span>
+              {formatSpeed(job.progress.speed)}
+              {job.progress.eta > 0 && ` · ETA ${formatETA(job.progress.eta)}`}
+            </span>
+          </div>
+        </>
+      )}
+
+      {job.status === "processing" && (
+        <div className="mt-1">
+          <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+            <motion.div
+              className="h-full rounded-full bg-yellow-500"
+              animate={{ x: ["-100%", "100%"] }}
+              transition={{ duration: 1.5, repeat: Infinity, ease: "easeInOut" }}
+              style={{ width: "40%" }}
+            />
+          </div>
+          <p className="mt-1 text-xs text-zinc-500">Post-processing...</p>
+        </div>
+      )}
+
+      {job.status === "complete" && job.filename && (
+        <a
+          href={`/files/${encodeURIComponent(job.filename)}`}
+          download
+          className="mt-1 inline-block text-xs text-emerald-400 transition-colors hover:text-emerald-300"
+        >
+          {job.filename}
+        </a>
+      )}
+
+      {job.status === "error" && job.error && (
+        <p className="mt-1 text-xs text-red-400">{job.error}</p>
+      )}
+    </motion.div>
+  );
+}
